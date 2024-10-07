@@ -1,0 +1,37 @@
+We have a use-case for Arduino, where we have to avoid the auto-reset feature of the Diecimila boards.
+It's because the Arduino is already running, controlling startup und shutdown of the host PC. 
+This is no problem with the NG boards, but with the Diecimila, the status of the Arduino is lost because it resets 
+as soon as the host PC is booting and the USB connection is established.
+
+Is there a way to modify (hardware or bootloader of) the Diecimila so that it does NOT auto-reset on a serial connection?
+
+The board is reset by the Serial port DTR line going low and pulsing the Arduino reset pin. 
+You can prevent this if you can disable DTR on your PC or by removing the capacitor that connects the DTR Serial pin 
+to the reset pin.
+
+I have researched this issue a bit on Linux and Windows. I have been able to get a client program (written in C++)
+ to connect and disconnect to my Arduino Diecimila without causing a reset.
+
+The solution lies in proper setup of the serial connection, and requires no extra hardware or hardware modification. 
+You hust have to disable HUPCL on linux and DTR on Windows
+
+On Linux you typically call tcsetattr
+Before you call it you set
+
+termios mode;
+::memset(&mode,0,sizeof( mode));
+tcgetattr(m_fd,& mode);
+... other settings here
+mode.c_cflag &= ~HUPCL;   // disable hang-up-on-close to avoid reset
+tcsetattr(m_fd,TCSANOW,&mode)
+
+On Windows
+
+DCB dcb;
+GetCommState(m_hCom, &dcb);
+... other settings here
+dcb.fDtrControl = DTR_CONTROL_DISABLE; // disable DTR to avoid reset
+SetCommState(m_hCom, &dcb);
+Then do NOT call EscapeCommFunction(...) or anything like that to set DTR later
+
+With these settings I have it working for both Windows and Linux, I can connect as many times as I wish without causing a reset of the board.
