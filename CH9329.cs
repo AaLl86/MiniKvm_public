@@ -11,7 +11,7 @@
  *     
  *  History:
  *     5/29/2024 - Initial implementation
- *     10/7/2024 - Last revision
+ *     01/10/2025 - Last revision
  */              
 
 using System;
@@ -27,6 +27,9 @@ using System.DirectoryServices.ActiveDirectory;
 using static MiniKvm.CH9329;
 using System.Net.Sockets;
 using System.IO.Ports;
+using DirectShowLib;
+using Emgu.CV.CvEnum;
+using System.Security.Policy;
 
 namespace MiniKvm
 {
@@ -37,15 +40,13 @@ namespace MiniKvm
     {
         #region Key Codes, Press type and Modifiers
         [Flags]
-        public enum KeyPressType
-        {
+        public enum KeyPressType {
             KeyPressed = 0x1,
             KeyReleased = 0x2,
             KeyPressedAndReleased = 0x3
         }
 
-        public enum KeyCode
-        {
+        public enum KeyCode {
             None = 0,
 
             // Letters
@@ -149,13 +150,19 @@ namespace MiniKvm
             KeyAdd = 0x57,
             KeyEnterRight = 0x58,
             KeyNumpad1 = 0x59,
+            KeyNumpad2 = 0x5A,
+            KeyNumpad3 = 0x5B,
+            KeyNumpad4 = 0x5C,
+            KeyNumpad5 = 0x5D,
+            KeyNumpad6 = 0x5E,
+            KeyNumpad7 = 0x5F,
+            KeyNumpad8 = 0x60,
             KeyNumpad9 = 0x61,
             KeyNumpad0 = 0x62,
         }
 
         [Flags]
-        public enum KeyModifier
-        {
+        public enum KeyModifier {
             None = 0,
             LeftCtrl = 0x1,
             LeftShift = 0x2,
@@ -197,6 +204,19 @@ namespace MiniKvm
             // Checksum
             //byte ChkSum;
         };
+
+        // The minimum allowed CH9329 packet size
+        public static int MinPacketSize = 6;
+
+        /// <summary>
+        /// Identify a non-packed, non-sequential CH9329 response
+        /// </summary>
+        private struct CH9329_Response {
+            public CH9329_PacketHdr PckHeader;
+            public ResponseType Type;
+            public byte[] PckData;
+            public byte Checksum;
+        }
 
         private enum PacketType
         {
@@ -422,14 +442,16 @@ namespace MiniKvm
                 PckBuffer = AssemblePacket(PacketType.CMD_SEND_KB_GENERAL_DATA, PckData);
 
                 // Introduce a minimum of delay between sending KeyUp and KeyDown
-                Thread.Sleep(20);
+                Thread.Sleep(10);
 
                 RetVal = pckSendFunction(PckBuffer);
             }
 
-#if FALSE
-            RetVal = WaitForCh9329Response(ResponseType.RESPONSE_SEND_KB_GENERAL_DATA, out PckData);
-#endif
+            if ((RetVal != false) && (pckReceiveFunction != null)) {
+                byte[] RecvData;
+                Thread.Sleep(8);
+                pckReceiveFunction(out RecvData);
+            }
 
             return RetVal;
         }
@@ -496,9 +518,10 @@ namespace MiniKvm
                 RetVal = pckSendFunction(PckBuffer);
             }
 
-#if FALSE
-            RetVal = WaitForCh9329Response(ResponseType.RESPONSE_SEND_MS_ABS_DATA, out PckData);
-#endif
+            if ((RetVal != false) && (pckReceiveFunction != null)) {
+                byte[] RecvData;
+                pckReceiveFunction(out RecvData);
+            }
 
             return RetVal;
         }
@@ -556,25 +579,28 @@ namespace MiniKvm
                 RetVal = pckSendFunction(PckBuffer);
             }
 
-#if FALSE
-            RetVal = WaitForCh9329Response(ResponseType.RESPONSE_SEND_MS_REL_DATA, out PckData);
-#endif
-
+            if ((RetVal != false) && (pckReceiveFunction != null)) {
+                byte[] RecvData;
+                pckReceiveFunction(out RecvData);
+            }
             return RetVal;
         }
 
         /// <summary>
         /// Read a response packet from the the Ch9329 controller. 
         /// </summary>
-        /// <param name="ExpectedResponse">Supplies a </param>
+        /// <param name="ExpectedResponse">Supplies the response that the caller is waiting on</param>
         /// <returns>A boolean value with the status of the operation.</returns>
         private bool WaitForCh9329Response(ResponseType ExpectedResponse, out byte[] ResponsePck) {
             int NumOfTrials = 0;
-            byte[] RawData;
+            byte[] RawData = null;
+            List<CH9329_Response> Packets = null;
+            int NumOfPcks = 0;
+            ResponseType responseType = ResponseType.RESPONSE_INVALID_PACKET;
             bool RetVal = false;
-            ResponseType responseType = ResponseType.RESPONSE_UNKNOWN;
 
             ResponsePck = null;
+
             if (pckReceiveFunction == null) {
                 return false;
             }
@@ -582,19 +608,30 @@ namespace MiniKvm
             while ((RetVal == false) && (NumOfTrials < 3)) {
 
                 // Give the time to the CH9329 chip to send back the response
-                Thread.Sleep(100);
+                Thread.Sleep(40);
 
                 RetVal = pckReceiveFunction(out RawData);
 
                 if ((RetVal != false) && (RawData != null)) {
-                    responseType = DecodePacket(RawData, out ResponsePck);
+                    NumOfPcks = DecodePackets(RawData, out Packets);
                 }
 
                 NumOfTrials += 1;
             }
 
-            // Log the failures (if any).
-            if (LastExpectedResponse != ExpectedResponse) {
+            // Search the expected response
+            for (int Index = 0; Index < NumOfPcks; Index += 1) {
+                CH9329_Response CurPck = Packets[Index];
+                if (CurPck.Type == ExpectedResponse) {
+                    responseType = CurPck.Type;
+                    ResponsePck = CurPck.PckData;
+                }
+                RetVal = true;
+            }
+
+            // Log any failure (if any).
+            if ((responseType != ExpectedResponse) &&
+                (LastExpectedResponse != ExpectedResponse)) {
 
                 if (RetVal == false) {
                     MiniKvmLogger.Log("WaitForCh9329Response: Unable to receive the expected " +
@@ -622,7 +659,6 @@ namespace MiniKvm
         /// <returns>A boolean value indicating the status of the operation.</returns>
         public bool SendGetInfo(bool WaitResponse, out InfoPacket? Info) {
             byte[]? requestPck = null;
-            byte[]? data = null;
             byte[]? responsePck = null;
             bool RetVal = false;
 
@@ -669,7 +705,6 @@ namespace MiniKvm
         /// <returns>A boolean value indicating the status of the operation</returns>
         public bool SendGetParameters(out ConfigPacket? Config) {
             byte[]? requestPck = null;
-            byte[]? data = null;
             byte[]? responsePck = null;
             bool RetVal = false;
             ConfigPacket LocalParams;
@@ -776,7 +811,6 @@ namespace MiniKvm
         public bool SendReset(bool WaitForResponse = true)
         {
             byte[] requestPck;
-            byte[] data;
             byte[] responsePck = new byte[1];
             bool RetVal = false;
 
@@ -814,67 +848,65 @@ namespace MiniKvm
         }
 
         /// <summary>
-        /// Determine whether a received packet is a valid CH9329 one
+        /// Determine whether a received packet is a valid CH9329 one.
         /// </summary>
         /// <param name="RawData">Supplies the raw packet data.</param>
+        /// <param name="ValidSize">Supplies an optional valid size of the buffer</param>
         /// <returns>A boolean value indicating whether the packet is a valid CH9329 one.</returns>
-        public bool IsPacketValid(byte[] RawData) {
-            ResponseType type;
-            bool PckValid;
+        public bool IsPacketValid(byte[] RawData, int ValidSize = 0) {
+            int HdrSize;
+            int Offset = 0;
+            int PckSize;
+            byte Sum;
+            ResponseType pckType = ResponseType.RESPONSE_INVALID_PACKET;
 
-            type = DecodePacket(RawData, out _);
-            PckValid = (type >= ResponseType.RESPONSE_INFO) &&
-                       (type <= ResponseType.RESPONSE_ERROR);
-
-            return PckValid;
-        }
-
-        private ResponseType GetPacketType(byte[] Buffer) {
-            return (DecodePacket(Buffer, out _));
-        }
-
-        /// <summary>
-        /// Search the first valid Ch9329 packet header into a data buffer.
-        /// </summary>
-        /// <param name="data">Supplies the raw data buffer containing a Ch9329 packet.</param>
-        /// <param name="ValidSize">Supplies a pointer to an int that will be filled with the valid
-        ///                         packet size</param>
-        /// <returns>Returns the offset of a valid packed into the raw data buffer, 
-        ///          -1 in case no valid Ch9329 packet has been found</returns>
-        public int SearchPckHeader(byte[] data, out int ValidSize) {
-            byte[] CandidatePck;
-            int HdrSize = Marshal.SizeOf(typeof(CH9329_PacketHdr));
-            ResponseType pckType;
-            int Offset = -1;
-            ValidSize = 0;
-
-            HdrSize += CH9329_ChecksumSize;
-
-            if (HdrSize >= data.Length) {
-                // The buffer must be at least Hdr+1 in size
-                return Offset;
+            if (ValidSize > 0) {
+                RawData = RawData.Take(ValidSize).ToArray();
             }
 
-            for (int Index = 0; Index < (data.Length - HdrSize); Index++) {
-                
-                if ((data[Index] == 0x57) &&
-                    (data[Index + 1] == 0xAB) &&
-                    (data[Index + 2] == 0x0)) {
+            HdrSize = Marshal.SizeOf(typeof(CH9329_PacketHdr));
 
-                    CandidatePck = data.Skip(Index).Take(data.Length - Index).ToArray();
+            if (RawData.Length < CH9329.MinPacketSize) { return false; }
 
-                    // We found a possible header, now validate it
-                    pckType = GetPacketType(CandidatePck);
+            for (Offset = RawData.Length - CH9329.MinPacketSize; Offset >= 0; Offset -= 1) {
 
-                    if (pckType != ResponseType.RESPONSE_INVALID_PACKET) {
-                        Offset = Index;
-                        ValidSize = data[Index + 4];
-                        break; 
-                    }
+                if ((RawData[Offset] != 0x57) || (RawData[Offset + 1] != 0xAB) || (RawData[Offset + 2] != 0)) {
+                    // The initial CH9329 header is invalid.
+                    continue;
                 }
+
+                // PckSize does *NOT* contain the final Checksum byte
+                PckSize = RawData[Offset + 4] + HdrSize;
+
+                if (PckSize + CH9329_ChecksumSize > RawData.Length - Offset) {
+                    continue;
+                }
+
+                // Now calculate the checksum since we know that the packet is big enough
+                Sum = 0;
+                for (int Index = 0; Index < PckSize; Index++) {
+                    Sum += RawData[Index + Offset];
+                }
+
+                if (Sum != RawData[PckSize + Offset]) {
+                    continue;
+                }
+
+                // Add the final checksum byte to the packet size
+                PckSize += CH9329_ChecksumSize;
+
+                // I found a valid CH9329 packet. My job is done here.
+                pckType = (ResponseType)RawData[Offset + 3];
+                break;
+            }
+           
+            if ((pckType >= ResponseType.RESPONSE_INFO) &&
+                (pckType <= ResponseType.RESPONSE_ERROR)) {
+
+                return true;
             }
 
-            return Offset;
+            return false;
         }
 
         /// <summary>
@@ -976,60 +1008,81 @@ namespace MiniKvm
         /// Internal function used to decode a Response packet.
         /// </summary>
         /// <param name="Buffer">Supplies the buffer containing the entire CH9329 packet</param>
-        /// <param name="PckData">If the decoding went well, return the internal packet data.</param>
-        /// <returns>A boolean value indicating the status of the operation.</returns>
-        private ResponseType DecodePacket(byte[] Buffer, out byte[]? PckData) {
-            GCHandle Handle;
-            CH9329_PacketHdr Hdr;
+        /// <param name="Packets">If the decoding went well, return a list of CH9329_Response.</param>
+        /// <returns>A value specifying the number of found valid CH9329 packets.</returns>
+        private int DecodePackets(byte[] Buffer, out List<CH9329_Response>? Packets) {
             int HdrSize;
-            ResponseType PckType;
-            int RealSize;
+            int Offset = 0;
+            int PckSize;
+            int ValidPcks = 0;
             byte Sum;
 
             HdrSize = Marshal.SizeOf(typeof(CH9329_PacketHdr));
-            PckData = null;
-            PckType = ResponseType.RESPONSE_INVALID_PACKET;
+            Packets = new List<CH9329_Response>();
 
-            if (Buffer.Length < HdrSize) {
-                Debug.WriteLine("DecodePacket - The buffer is smaller than the CH9329 header.");
-                return PckType;
+            if (Buffer.Length < CH9329.MinPacketSize) {
+                Debug.WriteLine("DecodePackets - The buffer is smaller than the CH9329 header.");
+                return 0;
+            }
+            
+            Offset = 0;
+            while (Offset <= Buffer.Length - CH9329.MinPacketSize) {
+
+                if ((Buffer[Offset] != 0x57) || (Buffer[Offset + 1] != 0xAB) || (Buffer[Offset + 2] != 0)) {
+                    // The initial CH9329 header is invalid.
+                    // Increase the index and go to the next possible packet
+                    Offset += 1;
+                    continue;
+                }
+
+                // PckSize does *NOT* contain the final Checksum byte
+                PckSize = Buffer[Offset + 4] + HdrSize;
+
+                if (PckSize + CH9329_ChecksumSize > Buffer.Length - Offset) {
+                    Debug.WriteLine("DecodePackets - Skipped packed {0} because the size does not match.", ValidPcks);
+                    Offset += 3;
+                    continue;
+                }
+
+
+                // Now calculate the checksum since we know that the packet is big enough
+                Sum = 0;
+                for (int Index = 0; Index < PckSize; Index++) {
+                    Sum += Buffer[Index + Offset];
+                }
+
+                if (Sum != Buffer[PckSize + Offset]) {
+                    Debug.WriteLine("DecodePackets - Packet {0} checksum invalid!", ValidPcks);
+                    Offset += PckSize;
+                    continue;
+                }
+
+                // Add the final checksum byte to the packet size
+                PckSize += CH9329_ChecksumSize;
+
+                // Packet is valid. Create a new CH9329_Response data structure
+                // and add it to the list.
+                CH9329_Response Response = new CH9329_Response();
+                Response.PckHeader.Header = (ushort)(Buffer[Offset] | Buffer[Offset + 1] << 8);
+                Response.PckHeader.AddressCode = Buffer[Offset + 2];
+                Response.PckHeader.Command = Buffer[Offset + 3];
+                Response.PckHeader.DataSize = Buffer[Offset + 4];
+                Response.Type = (ResponseType)Buffer[Offset + 3];
+                Response.Checksum = Sum;
+                Response.PckData = Buffer.Take(new Range(Offset + 5, Offset + PckSize)).ToArray();
+
+                /* OR use Marhsal conversion:
+                 * Handle = GCHandle.Alloc(Buffer, GCHandleType.Pinned);
+                 * Hdr = (CH9329_PacketHdr)Marshal.PtrToStructure(Handle.AddrOfPinnedObject(), typeof(CH9329_PacketHdr));
+                 * Handle.Free(); */
+
+                Packets.Add(Response);
+                ValidPcks += 1;
+
+                Offset += PckSize;
             }
 
-            Handle = GCHandle.Alloc(Buffer, GCHandleType.Pinned);
-            Hdr = (CH9329_PacketHdr)Marshal.PtrToStructure(Handle.AddrOfPinnedObject(), typeof(CH9329_PacketHdr));
-            Handle.Free();
-
-            if ((Hdr.Header != 0xAB57) || (Hdr.AddressCode != 0x0)) {
-                //Debug.WriteLine("DecodePacket - The CH9329 header is invalid.");
-                return PckType;
-            }
-
-            RealSize = Hdr.DataSize + HdrSize;
-
-            if (RealSize + CH9329_ChecksumSize > Buffer.Length) {
-                Debug.WriteLine("DecodePacket - The packet size is smaller than the buffer.");
-                return PckType;
-            }
-
-            //
-            // Now calculate the checksum since we know that the packet is big enough
-            //
-
-            Sum = 0;
-            for (int Index = 0; Index < RealSize; Index++) {
-                Sum += Buffer[Index];
-            }
-
-            if (Sum != Buffer[RealSize]) {
-                //Debug.WriteLine("DecodePacket - Packet checksum invalid!");
-                return PckType;
-            }
-
-            PckType = (ResponseType)Hdr.Command;
-            PckData = new byte[(int)Hdr.DataSize];
-            Array.Copy(Buffer, HdrSize, PckData, 0, Hdr.DataSize);
-
-            return PckType;
+            return ValidPcks;
         }
     }
 
@@ -1045,7 +1098,8 @@ namespace MiniKvm
         /// </summary>
         /// <param name="KeyCode">Supplies the Win32 Keycode</param>
         /// <returns>A CH9329 KeyCode</returns>
-        public static CH9329.KeyCode ConvertKeyCode(Win32Key KeyCode)
+        public static CH9329.KeyCode ConvertKeyCode(Win32Key KeyCode, 
+                                                    Win32KeyModifier modifier = Win32KeyModifier.None)
         {
             CH9329.KeyCode outCode;
             
@@ -1056,8 +1110,8 @@ namespace MiniKvm
             outCode = CH9329.KeyCode.None;
 
             //
-            // Letters (note that only uppercase letter are allowed, otherwise
-            // there will be a clash with the Win32 key code space)
+            // Letters. Note that only uppercase letter are allowed, otherwise
+            // there will be a clash with the Win32 key code space (0x61 - 0x7A)
             //
 
             if ((char)KeyCode >= 'A' && (char)KeyCode <= 'Z') { 
@@ -1106,27 +1160,50 @@ namespace MiniKvm
             else if (KeyCode == Win32Key.VK_HOME) {  outCode = CH9329.KeyCode.KeyHome; }
 
             //
-            // Brackets, Front slash, semicolon, Apostophe, comma, dot, Backslash
+            // OEM key code: Brackets, Front slash, semicolon, Apostophe, comma, dot, Backslash,
+            //               Dash, Plus, Tilde
+            //
+            // These needs to be translated in char and analyzed since they depends on the 
+            // active Keyboard layout.
             //
 
-            else if (KeyCode == Win32Key.VK_OEM_4) { outCode = CH9329.KeyCode.KeyOpenBracket; }
+            else if (KeyboardHook.KeyCodeNeedsTranslation(KeyCode) != false) {
+                char KeyChar = KeyboardHook.GetCharFromKeyCode(KeyCode);
+                if (KeyChar == ';') { outCode = CH9329.KeyCode.KeySemicolon; }          // VK_OEM_1
+                else if (KeyChar == '/') { outCode = CH9329.KeyCode.KeyBackSlash; }    // VK_OEM_2
+                else if (KeyChar == '`') { outCode = CH9329.KeyCode.KeyTilde; }         // VK_OEM_3
+                else if (KeyChar == '[') { outCode = CH9329.KeyCode.KeyOpenBracket; }   // VK_OEM_4
+                else if (KeyChar == '\\') { outCode = CH9329.KeyCode.KeyFrontSlash; }    // VK_OEM_5
+                else if (KeyChar == ']') { outCode = CH9329.KeyCode.KeyClosedBracket; } // VK_OEM_6
+                else if (KeyChar == '\'') { outCode = CH9329.KeyCode.KeyApostrophe; }   // VK_OEM_7
+                else if (KeyChar == '.') { outCode = CH9329.KeyCode.KeyPeriod; }        // VK_OEM_PERIOD
+                else if (KeyChar == ',') { outCode = CH9329.KeyCode.KeyComma; }         // VK_OEM_COMMA
+                else if (KeyChar == '-') { outCode = CH9329.KeyCode.KeyMinus; }         // VK_OEM_MINUS
+                else if (KeyChar == '=') { outCode = CH9329.KeyCode.KeyPlus; }          // VK_OEM_PLUS
+                else {
+                    // VK_OEM_8 I have no idea what translates to
+                    Debugger.Break();
+                }
+            }
+
+            /* else if (KeyCode == Win32Key.VK_OEM_4) { outCode = CH9329.KeyCode.KeyOpenBracket; }
             else if (KeyCode == Win32Key.VK_OEM_6) { outCode = CH9329.KeyCode.KeyClosedBracket; }
-            else if (KeyCode == Win32Key.VK_OEM_5) {  outCode = CH9329.KeyCode.KeyFrontSlash; }
-            else if (KeyCode == Win32Key.VK_OEM_1) {  outCode = CH9329.KeyCode.KeySemicolon; }
+            else if (KeyCode == Win32Key.VK_OEM_5) { outCode = CH9329.KeyCode.KeyFrontSlash; }
+            else if (KeyCode == Win32Key.VK_OEM_1) { outCode = CH9329.KeyCode.KeySemicolon; }
             else if (KeyCode == Win32Key.VK_OEM_7) { outCode = CH9329.KeyCode.KeyApostrophe; }
             else if (KeyCode == Win32Key.VK_OEM_PERIOD) { outCode = CH9329.KeyCode.KeyPeriod; }
             else if (KeyCode == Win32Key.VK_OEM_COMMA) {  outCode = CH9329.KeyCode.KeyComma; }
             else if (KeyCode == Win32Key.VK_OEM_2) {  outCode = CH9329.KeyCode.KeyBackSlash; }
+            else if (KeyCode == Win32Key.VK_OEM_MINUS) {  outCode = CH9329.KeyCode.KeyMinus; }
+            else if (KeyCode == Win32Key.VK_OEM_PLUS) {  outCode = CH9329.KeyCode.KeyPlus; }
+            else if (KeyCode == Win32Key.VK_OEM_3) {  outCode = CH9329.KeyCode.KeyTilde; } */
 
             //
-            // Capslock, NumLocks, Dash, Plus, Tilde
+            // Capslock, NumLocks
             //
 
             else if (KeyCode == Win32Key.VK_CAPITAL) {  outCode = CH9329.KeyCode.KeyCapsLock; }
             else if (KeyCode == Win32Key.VK_NUMLOCK) {  outCode = CH9329.KeyCode.KeyNumLock; }
-            else if (KeyCode == Win32Key.VK_OEM_MINUS) {  outCode = CH9329.KeyCode.KeyMinus; }
-            else if (KeyCode == Win32Key.VK_OEM_PLUS) {  outCode = CH9329.KeyCode.KeyPlus; }
-            else if (KeyCode == Win32Key.VK_OEM_3) {  outCode = CH9329.KeyCode.KeyTilde; }
 
             //
             // Numeric keypad
@@ -1152,42 +1229,58 @@ namespace MiniKvm
                                            (int)CH9329.KeyCode.KeyF1);
             }
 
+            //
+            // Modifiers (WIN SHIFT, CTRL, ALT)
+            //
+
+            else if ((KeyCode == Win32Key.VK_LWIN) || (KeyCode == Win32Key.VK_RWIN) ||
+                     (KeyCode == Win32Key.VK_LSHIFT) || (KeyCode == Win32Key.VK_RSHIFT) ||
+                     (KeyCode == Win32Key.VK_LCONTROL) || (KeyCode == Win32Key.VK_RCONTROL) ||
+                     (KeyCode == Win32Key.VK_LMENU) || (KeyCode == Win32Key.VK_RMENU)) {
+
+                // The modifiers are intercepted later in ConvertKeyModifier, so do nothing here.
+            }
+
+            else {
+                Debugger.Break();
+            }
+
            return outCode;
         }
 
-        public static CH9329.KeyModifier ConvertKeyModifier(KeyboardHook.KeyModifier modifier) 
+        public static CH9329.KeyModifier ConvertKeyModifier(Win32KeyModifier modifier) 
         { 
             CH9329.KeyModifier outModifier = CH9329.KeyModifier.None;
 
-            if (modifier.HasFlag(KeyboardHook.KeyModifier.LeftAltKey)) {
+            if (modifier.HasFlag(Win32KeyModifier.LeftAltKey)) {
                 outModifier |= CH9329.KeyModifier.LeftAlt;
             } 
 
-            if (modifier.HasFlag(KeyboardHook.KeyModifier.RightAltKey)) {
+            if (modifier.HasFlag(Win32KeyModifier.RightAltKey)) {
                 outModifier |= CH9329.KeyModifier.RightAlt;
             }
 
-            if (modifier.HasFlag(KeyboardHook.KeyModifier.LeftCtrlKey)) {
+            if (modifier.HasFlag(Win32KeyModifier.LeftCtrlKey)) {
                 outModifier |= CH9329.KeyModifier.LeftCtrl;
             } 
 
-            if (modifier.HasFlag(KeyboardHook.KeyModifier.RightCtrlKey)) {
+            if (modifier.HasFlag(Win32KeyModifier.RightCtrlKey)) {
                 outModifier |= CH9329.KeyModifier.RightCtrl;
             }
 
-            if (modifier.HasFlag(KeyboardHook.KeyModifier.LeftShiftKey)) {
+            if (modifier.HasFlag(Win32KeyModifier.LeftShiftKey)) {
                 outModifier |= CH9329.KeyModifier.LeftShift;
             } 
 
-            if (modifier.HasFlag(KeyboardHook.KeyModifier.RightShiftKey)) {
+            if (modifier.HasFlag(Win32KeyModifier.RightShiftKey)) {
                 outModifier |= CH9329.KeyModifier.RightShift;
             }
 
-            if (modifier.HasFlag(KeyboardHook.KeyModifier.LeftWindowsKey)) {
+            if (modifier.HasFlag(Win32KeyModifier.LeftWindowsKey)) {
                 outModifier |= CH9329.KeyModifier.LeftWindows;
             } 
 
-            if (modifier.HasFlag(KeyboardHook.KeyModifier.RightWindowsKey)) {
+            if (modifier.HasFlag(Win32KeyModifier.RightWindowsKey)) {
                 outModifier |= CH9329.KeyModifier.RightWindows;
             }
 
@@ -1222,6 +1315,24 @@ namespace MiniKvm
 
             return outButtons;
         }
+
+        public static CH9329.KbdIndicator ConvertKeyLocksIndicators(Win32KeyIndicators indicators) {
+            CH9329.KbdIndicator ChIndicators = KbdIndicator.NONE;
+
+            if (indicators.HasFlag(Win32KeyIndicators.CapsLock)) {
+                ChIndicators |= KbdIndicator.CAPS_LOCK;
+            }
+
+            if (indicators.HasFlag(Win32KeyIndicators.NumLock)) {
+                ChIndicators |= KbdIndicator.NUM_LOCK;
+            }
+
+            if (indicators.HasFlag(Win32KeyIndicators.ScrollLock)) {
+                ChIndicators |= KbdIndicator.SCROLL_LOCK;
+            }
+
+            return ChIndicators;
+        }
+        #endregion
     }
-    #endregion
 }
